@@ -3,10 +3,21 @@ import AVFoundation
 
 class PreviewView: UIView {
   var videoPreviewLayer: AVCaptureVideoPreviewLayer {
-    guard let layer = layer as? AVCaptureVideoPreviewLayer else {
+    let previewLayer: AVCaptureVideoPreviewLayer? = {
+      if Thread.current.isMainThread {
+        return layer as? AVCaptureVideoPreviewLayer
+      } else {
+        return DispatchQueue.main.sync {
+          return layer as? AVCaptureVideoPreviewLayer
+        }
+      }
+    }()
+    
+    guard let thePreviewLayer = previewLayer else {
       fatalError("Expected `AVCaptureVideoPreviewLayer` type for layer. Check PreviewView.layerClass implementation.")
     }
-    return layer
+    
+    return thePreviewLayer
   }
 
   var session: AVCaptureSession? {
