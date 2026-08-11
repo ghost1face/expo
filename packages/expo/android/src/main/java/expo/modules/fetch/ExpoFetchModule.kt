@@ -147,6 +147,41 @@ class ExpoFetchModule : Module() {
         }
       }
 
+      // Sync: establish RequestSink + enqueue OkHttp call before JS pumps chunks.
+      Function("startWithStreamingBody") {
+          request: NativeRequest,
+          url: URL,
+          requestInit: NativeRequestInit ->
+        request.startWithStreamingBody(client, url, requestInit)
+      }
+
+      AsyncFunction("waitForStreamingResponse") { request: NativeRequest, promise: Promise ->
+        request.response.waitForStates(
+          listOf(
+            ResponseState.RESPONSE_RECEIVED,
+            ResponseState.ERROR_RECEIVED
+          )
+        ) { state ->
+          if (state == ResponseState.RESPONSE_RECEIVED) {
+            promise.resolve()
+          } else if (state == ResponseState.ERROR_RECEIVED) {
+            promise.reject(request.response.error?.toCodedException() ?: FetchUnknownException())
+          }
+        }
+      }
+
+      Function("sendBodyChunk") { request: NativeRequest, chunk: ByteArray ->
+        request.sendBodyChunk(chunk)
+      }
+
+      Function("finishBody") { request: NativeRequest ->
+        request.finishBody()
+      }
+
+      Function("failBody") { request: NativeRequest, message: String ->
+        request.failBody(message)
+      }
+
       AsyncFunction("cancel") { request: NativeRequest ->
         request.cancel()
       }

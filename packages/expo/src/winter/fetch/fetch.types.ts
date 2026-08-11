@@ -8,6 +8,12 @@ export interface FetchRequestInit {
   method?: string;
   signal?: AbortSignal | null;
   redirect?: RequestRedirect;
+  /**
+   * Required by the fetch spec when sending a ReadableStream request body.
+   * On Android and iOS, `duplex: 'half'` enables native streaming upload (no JS buffering).
+   * When omitted, expo/fetch still streams ReadableStream bodies on native platforms.
+   */
+  duplex?: 'half';
 
   // Not supported fields
   integrity?: string;

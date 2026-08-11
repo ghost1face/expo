@@ -57,6 +57,12 @@ data class Request(
     method = request.method,
     headers = request.headers.toSingleMap(),
     postData = request.body?.let {
+      // Never drain streaming / one-shot bodies for DevTools. contentLength() == -1 previously
+      // matched "< MAX_BODY_SIZE" and writeTo() re-consumed the body after OkHttp already sent it,
+      // hanging network interceptors so callbacks never settled.
+      if (it.isDuplex() || it.isOneShot() || it.contentLength() < 0) {
+        return@let null
+      }
       if (it.contentLength() < ExpoNetworkInspectOkHttpNetworkInterceptor.MAX_BODY_SIZE) {
         val buffer = Buffer()
         it.writeTo(buffer)

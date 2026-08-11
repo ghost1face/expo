@@ -20,6 +20,12 @@ import java.io.IOException
 internal class NativeResponse(appContext: AppContext, private val coroutineScope: CoroutineScope) :
   SharedObject(appContext), Callback {
   val sink = ResponseSink()
+  /**
+   * Optional streaming request body sink. Finished when response headers arrive so writers
+   * don't remain stuck waiting for chunks after the server has already responded (e.g. early 4xx/5xx).
+   */
+  @Volatile
+  var requestSink: RequestSink? = null
   private var state: ResponseState = ResponseState.INITIALIZED
     get() = synchronized(this) { field }
     private set(value) {
@@ -78,6 +84,8 @@ internal class NativeResponse(appContext: AppContext, private val coroutineScope
   fun emitRequestCanceled() {
     val error = FetchRequestCanceledException()
     this.error = error
+    requestSink?.fail(error)
+    requestSink = null
     if (state == ResponseState.BODY_STREAMING_STARTED) {
       emit("didFailWithError", error.localizedMessageWithCauseLocalizedMessage())
     }
@@ -106,6 +114,9 @@ internal class NativeResponse(appContext: AppContext, private val coroutineScope
       return
     }
 
+    requestSink?.fail(e)
+    requestSink = null
+
     if (isInvalidState(
         ResponseState.STARTED,
         ResponseState.RESPONSE_RECEIVED,
@@ -129,6 +140,8 @@ internal class NativeResponse(appContext: AppContext, private val coroutineScope
       response.close()
       val error = FetchRedirectException()
       this.error = error
+      requestSink?.fail(error)
+      requestSink = null
       if (state == ResponseState.BODY_STREAMING_STARTED) {
         emit("didFailWithError", error.localizedMessageWithCauseLocalizedMessage())
       }
@@ -136,6 +149,10 @@ internal class NativeResponse(appContext: AppContext, private val coroutineScope
       emit("readyForJSFinalization")
       return
     }
+
+    // Unblock writeTo if it is still waiting for chunks after headers arrive.
+    requestSink?.finish()
+    requestSink = null
 
     responseInit = createResponseInit(response)
     state = ResponseState.RESPONSE_RECEIVED

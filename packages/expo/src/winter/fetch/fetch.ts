@@ -1,3 +1,5 @@
+import { Platform } from 'react-native';
+
 import { ExpoFetchModule } from './ExpoFetchModule';
 import { FetchError } from './FetchErrors';
 import { FetchResponse, type AbortSubscriptionCleanupFunction } from './FetchResponse';
@@ -9,6 +11,7 @@ import {
   normalizeMethod,
 } from './RequestUtils';
 import type { FetchRequestInit, FetchRequestLike } from './fetch.types';
+import { pumpReadableStreamToNativeRequest } from './pumpReadableStreamToNativeRequest';
 
 /** Returns if `input` is a Request object */
 const isRequest = (input: any): input is FetchRequestLike => {
@@ -30,6 +33,53 @@ const dangerouslyGetBodyFromRequest = (
     return input?.body ?? null;
   }
 };
+
+function isReadableStreamBody(body: unknown): body is ReadableStream<Uint8Array> {
+  return typeof ReadableStream !== 'undefined' && body instanceof ReadableStream;
+}
+
+function shouldStreamRequestBody(
+  body: unknown,
+  init?: FetchRequestInit
+): body is ReadableStream<Uint8Array> {
+  if (!isReadableStreamBody(body)) {
+    return false;
+  }
+
+  // Honor fetch duplex semantics when provided; default to streaming on native for all streams.
+  if (init?.duplex != null && init.duplex !== 'half') {
+    return false;
+  }
+
+  return Platform.OS === 'android' || Platform.OS === 'ios';
+}
+
+function combineAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  if (typeof AbortSignal !== 'undefined' && typeof (AbortSignal as any).any === 'function') {
+    return (AbortSignal as any).any([a, b]);
+  }
+
+  const controller = new AbortController();
+  const abort = (reason?: unknown) => {
+    if (!controller.signal.aborted) {
+      controller.abort(reason);
+    }
+  };
+
+  if (a.aborted) {
+    abort(a.reason);
+  } else {
+    a.addEventListener('abort', () => abort(a.reason), { once: true });
+  }
+
+  if (b.aborted) {
+    abort(b.reason);
+  } else {
+    b.addEventListener('abort', () => abort(b.reason), { once: true });
+  }
+
+  return controller.signal;
+}
 
 // TODO(@kitten): Do we really want to use our own types for web standards?
 export async function fetch(
@@ -62,11 +112,6 @@ export async function fetch(
 
   const request = new ExpoFetchModule.NativeRequest(response) as NativeRequest;
 
-  const { body: requestBody, overriddenHeaders } = await normalizeBodyInitAsync(body);
-  if (overriddenHeaders) {
-    headers = overrideHeaders(headers, overriddenHeaders);
-  }
-
   const nativeRequestInit: NativeRequestInit = {
     credentials: credentials ?? 'include',
     headers,
@@ -84,7 +129,65 @@ export async function fetch(
     request.cancel();
   });
   try {
-    await request.start(`${url}`, nativeRequestInit, requestBody);
+    if (shouldStreamRequestBody(body, init)) {
+      // Sync: RequestSink must exist before JS pumps chunks.
+      request.startWithStreamingBody(`${url}`, nativeRequestInit);
+
+      // Register response waiter before pumping so we don't miss early headers (e.g. 4xx/5xx).
+      const responsePromise = request.waitForStreamingResponse();
+
+      // Critical: when headers arrive, the pump is often blocked on `reader.read()` (file I/O),
+      // not on sendBodyChunk. finishBody() alone cannot unblock that — we must soft-abort the
+      // ReadableStream reader so pump exits and fetch can return the status to middleware.
+      const stopPump = new AbortController();
+      const stopPumpForResponse = () => {
+        request.finishBody();
+        if (!stopPump.signal.aborted) {
+          stopPump.abort();
+        }
+      };
+      void responsePromise
+        .then(
+          () => {
+            stopPumpForResponse();
+          },
+          () => {
+            stopPumpForResponse();
+          }
+        )
+        .catch(() => {});
+
+      const userSignal = signal ?? undefined;
+      const pumpSignal = userSignal
+        ? combineAbortSignals(userSignal, stopPump.signal)
+        : stopPump.signal;
+
+      try {
+        // Soft abort only for the response-driven stopPump signal path. User abort goes through
+        // request.cancel() via abortSubscription; pump soft-abort then exits as the response/error settles.
+        await pumpReadableStreamToNativeRequest(body, request, pumpSignal, 'soft');
+      } catch (pumpError: unknown) {
+        if (userSignal?.aborted) {
+          throw pumpError instanceof Error ? pumpError : new FetchError(String(pumpError));
+        }
+        // Prefer a settled HTTP response when the upload was cut short.
+        try {
+          await responsePromise;
+        } catch {
+          request.failBody(pumpError instanceof Error ? pumpError.message : String(pumpError));
+          throw pumpError;
+        }
+      }
+
+      await responsePromise;
+    } else {
+      const { body: requestBody, overriddenHeaders } = await normalizeBodyInitAsync(body);
+      if (overriddenHeaders) {
+        headers = overrideHeaders(headers, overriddenHeaders);
+        nativeRequestInit.headers = headers;
+      }
+      await request.start(`${url}`, nativeRequestInit, requestBody);
+    }
   } catch (e: unknown) {
     if (e instanceof Error) {
       throw FetchError.createFromError(e);

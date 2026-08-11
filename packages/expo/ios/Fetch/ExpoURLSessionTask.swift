@@ -9,6 +9,9 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
   private let delegate: ExpoURLSessionTaskDelegate
   private var task: URLSessionDataTask?
 
+  /** Streaming uploads keep timeoutInterval at 0 (same as buffered requests): no hard request ceiling. */
+  private static let streamingTimeoutInterval: TimeInterval = 0
+
   init(delegate: ExpoURLSessionTaskDelegate) {
     self.delegate = delegate
     super.init()
@@ -21,10 +24,40 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
     requestInit: NativeRequestInit,
     requestBody: Data?
   ) {
+    let request = buildRequest(url: url, requestInit: requestInit, streaming: false)
+    request.httpBody = requestBody
+    resume(urlSession: urlSession, urlSessionDelegate: urlSessionDelegate, request: request as URLRequest)
+  }
+
+  func startWithStreamingBody(
+    urlSession: URLSession,
+    urlSessionDelegate: URLSessionSessionDelegateProxy,
+    url: URL,
+    requestInit: NativeRequestInit,
+    bodyStream: RequestBodyStream
+  ) {
+    let request = buildRequest(url: url, requestInit: requestInit, streaming: true)
+    // Omit Content-Length so URLSession uses chunked transfer for the stream.
+    request.setValue(nil, forHTTPHeaderField: "Content-Length")
+    // Mark so DevTools does not drain the one-shot httpBodyStream for CDP postData.
+    URLProtocol.setProperty(true, forKey: "ExpoFetchStreamingRequestBody", in: request)
+    bodyStream.openIfNeeded()
+    request.httpBodyStream = bodyStream.inputStream
+    resume(urlSession: urlSession, urlSessionDelegate: urlSessionDelegate, request: request as URLRequest)
+  }
+
+  func cancel(urlSessionDelegate: URLSessionSessionDelegateProxy) {
+    if let task {
+      urlSessionDelegate.removeDelegate(task: task)
+      task.cancel()
+    }
+  }
+
+  private func buildRequest(url: URL, requestInit: NativeRequestInit, streaming: Bool) -> NSMutableURLRequest {
     let request = NSMutableURLRequest(url: url)
     URLProtocol.setProperty(requestInit.redirect == .follow, forKey: "shouldFollowRedirects", in: request)
     request.httpMethod = requestInit.method
-    request.timeoutInterval = 0
+    request.timeoutInterval = streaming ? Self.streamingTimeoutInterval : 0
     if requestInit.credentials == .include {
       request.httpShouldHandleCookies = true
       if let cookies = HTTPCookieStorage.shared.cookies(for: url) {
@@ -36,20 +69,19 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
     for tuple in requestInit.headers {
       request.addValue(tuple[1], forHTTPHeaderField: tuple[0])
     }
-    request.httpBody = requestBody
+    return request
+  }
 
-    let task = urlSession.dataTask(with: request as URLRequest)
+  private func resume(
+    urlSession: URLSession,
+    urlSessionDelegate: URLSessionSessionDelegateProxy,
+    request: URLRequest
+  ) {
+    let task = urlSession.dataTask(with: request)
     urlSessionDelegate.addDelegate(task: task, delegate: self)
     self.task = task
     task.resume()
     self.delegate.urlSessionDidStart(self)
-  }
-
-  func cancel(urlSessionDelegate: URLSessionSessionDelegateProxy) {
-    if let task {
-      urlSessionDelegate.removeDelegate(task: task)
-      task.cancel()
-    }
   }
 
   // MARK: - URLSessionTaskDelegate/URLSessionDataDelegate implementations

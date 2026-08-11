@@ -7,6 +7,11 @@ import ExpoModulesCore
  */
 internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @unchecked Sendable {
   internal let sink: ResponseSink
+  /**
+   Optional streaming request body. Finished when response headers arrive so writers
+   don't remain stuck waiting for chunks after the server has already responded.
+   */
+  var requestBodyStream: RequestBodyStream?
 
   private let dispatchQueue: DispatchQueue
 
@@ -62,6 +67,8 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
   func emitRequestCanceled() {
     let error = FetchRequestCanceledException()
     self.error = error
+    requestBodyStream?.fail(error)
+    requestBodyStream = nil
     if state == .bodyStreamingStarted {
       emit(event: "didFailWithError", payload: error.localizedDescription)
     }
@@ -152,6 +159,9 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
       if self.isInvalidState(.started) {
         return
       }
+      // Unblock httpBodyStream readers if still waiting for chunks after headers arrive.
+      self.requestBodyStream?.finish()
+      self.requestBodyStream = nil
       self.responseInit = Self.createResponseInit(response: response)
       self.state = .responseReceived
     }
@@ -194,6 +204,8 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
       if self.redirectMode == .error {
         let error = FetchRedirectException()
         self.error = error
+        self.requestBodyStream?.fail(error)
+        self.requestBodyStream = nil
         if self.state == .bodyStreamingStarted {
           self.emit(event: "didFailWithError", payload: error.localizedDescription)
         }
@@ -250,8 +262,12 @@ internal final class NativeResponse: SharedObject, ExpoURLSessionTaskDelegate, @
 
     if let error {
       self.error = error
+      requestBodyStream?.fail(error)
+      requestBodyStream = nil
       state = .errorReceived
     } else {
+      requestBodyStream?.finish()
+      requestBodyStream = nil
       state = .bodyCompleted
     }
 

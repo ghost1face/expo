@@ -117,6 +117,40 @@ public final class ExpoFetchModule: Module {
         }
       }.runOnQueue(fetchRequestQueue)
 
+      Function("startWithStreamingBody") { (request: NativeRequest, url: URL, requestInit: NativeRequestInit) in
+        // Sync: body stream must exist before JS pumps chunks (same contract as Android).
+        fetchRequestQueue.sync {
+          request.startWithStreamingBody(
+            urlSession: urlSession,
+            urlSessionDelegate: urlSessionDelegate,
+            url: url,
+            requestInit: requestInit
+          )
+        }
+      }
+
+      AsyncFunction("waitForStreamingResponse") { (request: NativeRequest, promise: Promise) in
+        request.response.waitFor(states: [.responseReceived, .errorReceived]) { state in
+          if state == .responseReceived {
+            promise.resolve()
+          } else if state == .errorReceived {
+            promise.reject(request.response.error ?? FetchUnknownException())
+          }
+        }
+      }.runOnQueue(fetchRequestQueue)
+
+      Function("sendBodyChunk") { (request: NativeRequest, chunk: Data) in
+        try request.sendBodyChunk(chunk)
+      }
+
+      Function("finishBody") { (request: NativeRequest) in
+        request.finishBody()
+      }
+
+      Function("failBody") { (request: NativeRequest, message: String) in
+        request.failBody(message)
+      }
+
       AsyncFunction("cancel") { (request: NativeRequest) in
         request.cancel(urlSessionDelegate: self.urlSessionDelegate)
       }.runOnQueue(fetchRequestQueue)

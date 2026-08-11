@@ -8,6 +8,13 @@ export declare class NativeRequest extends SharedObject {
     requestInit: NativeRequestInit,
     requestBody: Uint8Array | null
   ): Promise<NativeResponse>;
+  /** Sync: create the native streaming body sink and enqueue the HTTP call. */
+  public startWithStreamingBody(url: string, requestInit: NativeRequestInit): void;
+  /** Resolves when headers/status are received (or the request fails). */
+  public waitForStreamingResponse(): Promise<NativeResponse>;
+  public sendBodyChunk(chunk: Uint8Array): void;
+  public finishBody(): void;
+  public failBody(message: string): void;
   public cancel(): void;
 }
 
