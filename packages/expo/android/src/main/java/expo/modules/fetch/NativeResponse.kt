@@ -90,6 +90,7 @@ internal class NativeResponse(appContext: AppContext, private val coroutineScope
       emit("didFailWithError", error.localizedMessageWithCauseLocalizedMessage())
     }
     state = ResponseState.ERROR_RECEIVED
+    emit("readyForJSFinalization")
   }
 
   fun waitForStates(states: List<ResponseState>, callback: (ResponseState) -> Unit) {

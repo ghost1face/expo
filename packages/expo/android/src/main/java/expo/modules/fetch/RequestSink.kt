@@ -14,33 +14,41 @@ internal class RequestSink {
   private object EndOfBody : QueueItem()
   private data class BodyChunk(val data: ByteArray) : QueueItem()
 
+  private val lock = Any()
   private val queue = LinkedBlockingQueue<QueueItem>()
   @Volatile
   private var closed = false
+  @Volatile
   private var failure: Exception? = null
 
   fun writeChunk(data: ByteArray) {
-    if (closed) {
-      throw IOException("Request body is already closed")
+    synchronized(lock) {
+      if (closed) {
+        throw IOException("Request body is already closed")
+      }
+      queue.put(BodyChunk(data))
     }
-    queue.put(BodyChunk(data))
   }
 
   fun finish() {
-    if (closed) {
-      return
+    synchronized(lock) {
+      if (closed) {
+        return
+      }
+      closed = true
+      queue.put(EndOfBody)
     }
-    closed = true
-    queue.put(EndOfBody)
   }
 
   fun fail(error: Exception) {
-    if (closed) {
-      return
+    synchronized(lock) {
+      if (closed) {
+        return
+      }
+      closed = true
+      failure = error
+      queue.put(EndOfBody)
     }
-    closed = true
-    failure = error
-    queue.put(EndOfBody)
   }
 
   /**

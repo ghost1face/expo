@@ -15,6 +15,9 @@ struct RequestBodyStreamTests {
     try body.writeChunk(Data([4, 5]))
     body.finish()
 
+    // Allow the background writer to drain into the bound stream.
+    Thread.sleep(forTimeInterval: 0.05)
+
     var buffer = [UInt8](repeating: 0, count: 16)
     let firstRead = body.inputStream.read(&buffer, maxLength: buffer.count)
     #expect(firstRead == 5)
@@ -56,6 +59,8 @@ struct RequestBodyStreamTests {
     try body.writeChunk(Data([9]))
     body.finish()
 
+    Thread.sleep(forTimeInterval: 0.05)
+
     var buffer = [UInt8](repeating: 0, count: 8)
     let read = body.inputStream.read(&buffer, maxLength: buffer.count)
     #expect(read == 1)
@@ -73,12 +78,10 @@ struct RequestBodyStreamTests {
 
     DispatchQueue.global(qos: .userInitiated).async {
       var buffer = [UInt8](repeating: 0, count: 8)
-      // Bound stream may block until the paired output is closed.
       readCount = body.inputStream.read(&buffer, maxLength: buffer.count)
       group.leave()
     }
 
-    // Give the reader a moment to block on an empty stream.
     Thread.sleep(forTimeInterval: 0.05)
     body.finish()
 
@@ -109,5 +112,22 @@ struct RequestBodyStreamTests {
     #expect(throws: (any Error).self) {
       try body.writeChunk(Data([1]))
     }
+  }
+
+  @Test
+  func `writeChunk returns without blocking when the bound buffer is full`() throws {
+    let body = RequestBodyStream()
+    body.openIfNeeded()
+
+    // Fill well beyond the 256KB bound buffer; enqueue must stay non-blocking for JS.
+    let chunk = Data(repeating: 1, count: 64 * 1024)
+    let started = Date()
+    for _ in 0..<16 {
+      try body.writeChunk(chunk)
+    }
+    let elapsed = Date().timeIntervalSince(started)
+    #expect(elapsed < 0.5)
+
+    body.finish()
   }
 }

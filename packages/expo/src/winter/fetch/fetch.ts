@@ -54,33 +54,6 @@ function shouldStreamRequestBody(
   return Platform.OS === 'android' || Platform.OS === 'ios';
 }
 
-function combineAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
-  if (typeof AbortSignal !== 'undefined' && typeof (AbortSignal as any).any === 'function') {
-    return (AbortSignal as any).any([a, b]);
-  }
-
-  const controller = new AbortController();
-  const abort = (reason?: unknown) => {
-    if (!controller.signal.aborted) {
-      controller.abort(reason);
-    }
-  };
-
-  if (a.aborted) {
-    abort(a.reason);
-  } else {
-    a.addEventListener('abort', () => abort(a.reason), { once: true });
-  }
-
-  if (b.aborted) {
-    abort(b.reason);
-  } else {
-    b.addEventListener('abort', () => abort(b.reason), { once: true });
-  }
-
-  return controller.signal;
-}
-
 // TODO(@kitten): Do we really want to use our own types for web standards?
 export async function fetch(
   input: string | URL | FetchRequestLike,
@@ -105,6 +78,8 @@ export async function fetch(
   );
 
   let abortSubscription: AbortSubscriptionCleanupFunction | null = null;
+  // Soft-abort controller for response-driven pump exit (early headers). User abort uses cancel().
+  let stopPump: AbortController | null = null;
 
   const response = new FetchResponse(() => {
     abortSubscription?.();
@@ -127,6 +102,8 @@ export async function fetch(
     // native events can't reach an abandoned controller.
     response.abort(signal?.reason);
     request.cancel();
+    // Also unblock the pump if it is waiting on reader.read().
+    stopPump?.abort();
   });
   try {
     if (shouldStreamRequestBody(body, init)) {
@@ -139,35 +116,25 @@ export async function fetch(
       // Critical: when headers arrive, the pump is often blocked on `reader.read()` (file I/O),
       // not on sendBodyChunk. finishBody() alone cannot unblock that — we must soft-abort the
       // ReadableStream reader so pump exits and fetch can return the status to middleware.
-      const stopPump = new AbortController();
+      stopPump = new AbortController();
       const stopPumpForResponse = () => {
-        request.finishBody();
-        if (!stopPump.signal.aborted) {
-          stopPump.abort();
+        try {
+          request.finishBody();
+        } catch {
+          // Body may already be failed/canceled.
+        }
+        if (!stopPump!.signal.aborted) {
+          stopPump!.abort();
         }
       };
-      void responsePromise
-        .then(
-          () => {
-            stopPumpForResponse();
-          },
-          () => {
-            stopPumpForResponse();
-          }
-        )
-        .catch(() => {});
-
-      const userSignal = signal ?? undefined;
-      const pumpSignal = userSignal
-        ? combineAbortSignals(userSignal, stopPump.signal)
-        : stopPump.signal;
+      void responsePromise.then(stopPumpForResponse, stopPumpForResponse);
 
       try {
-        // Soft abort only for the response-driven stopPump signal path. User abort goes through
-        // request.cancel() via abortSubscription; pump soft-abort then exits as the response/error settles.
-        await pumpReadableStreamToNativeRequest(body, request, pumpSignal, 'soft');
+        // Only the response-driven stopPump uses soft abort. User abort calls request.cancel()
+        // above and then aborts stopPump so the pump exits without finish-vs-fail races.
+        await pumpReadableStreamToNativeRequest(body, request, stopPump.signal, 'soft');
       } catch (pumpError: unknown) {
-        if (userSignal?.aborted) {
+        if (signal?.aborted) {
           throw pumpError instanceof Error ? pumpError : new FetchError(String(pumpError));
         }
         // Prefer a settled HTTP response when the upload was cut short.

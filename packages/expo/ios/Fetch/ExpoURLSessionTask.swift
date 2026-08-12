@@ -9,9 +9,6 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
   private let delegate: ExpoURLSessionTaskDelegate
   private var task: URLSessionDataTask?
 
-  /** Streaming uploads keep timeoutInterval at 0 (same as buffered requests): no hard request ceiling. */
-  private static let streamingTimeoutInterval: TimeInterval = 0
-
   init(delegate: ExpoURLSessionTaskDelegate) {
     self.delegate = delegate
     super.init()
@@ -24,7 +21,7 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
     requestInit: NativeRequestInit,
     requestBody: Data?
   ) {
-    let request = buildRequest(url: url, requestInit: requestInit, streaming: false)
+    let request = buildRequest(url: url, requestInit: requestInit)
     request.httpBody = requestBody
     resume(urlSession: urlSession, urlSessionDelegate: urlSessionDelegate, request: request as URLRequest)
   }
@@ -36,7 +33,7 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
     requestInit: NativeRequestInit,
     bodyStream: RequestBodyStream
   ) {
-    let request = buildRequest(url: url, requestInit: requestInit, streaming: true)
+    let request = buildRequest(url: url, requestInit: requestInit)
     // Omit Content-Length so URLSession uses chunked transfer for the stream.
     request.setValue(nil, forHTTPHeaderField: "Content-Length")
     // Mark so DevTools does not drain the one-shot httpBodyStream for CDP postData.
@@ -53,11 +50,12 @@ internal final class ExpoURLSessionTask: NSObject, URLSessionTaskDelegate, URLSe
     }
   }
 
-  private func buildRequest(url: URL, requestInit: NativeRequestInit, streaming: Bool) -> NSMutableURLRequest {
+  private func buildRequest(url: URL, requestInit: NativeRequestInit) -> NSMutableURLRequest {
     let request = NSMutableURLRequest(url: url)
     URLProtocol.setProperty(requestInit.redirect == .follow, forKey: "shouldFollowRedirects", in: request)
     request.httpMethod = requestInit.method
-    request.timeoutInterval = streaming ? Self.streamingTimeoutInterval : 0
+    // No hard request ceiling for buffered or streaming uploads.
+    request.timeoutInterval = 0
     if requestInit.credentials == .include {
       request.httpShouldHandleCookies = true
       if let cookies = HTTPCookieStorage.shared.cookies(for: url) {

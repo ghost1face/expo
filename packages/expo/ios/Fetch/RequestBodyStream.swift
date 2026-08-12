@@ -3,24 +3,29 @@
 import Foundation
 
 /**
- Bridges JS ReadableStream chunks to a URLSession `httpBodyStream` using a bound stream pair.
- The input stream is handed to URLSession; chunks are written to the paired output stream.
+ Bridges JS ReadableStream chunks to a URLSession `httpBodyStream`.
+
+ JS writes into an unbounded in-memory queue (never blocks the bridge thread). A background
+ writer drains that queue into a bound `OutputStream` pair that URLSession reads from.
  */
 internal final class RequestBodyStream: @unchecked Sendable {
-  private static let bufferSize = 256 * 1024
+  private static let boundBufferSize = 256 * 1024
 
   let inputStream: InputStream
   private let outputStream: OutputStream
-  private let lock = NSLock()
+  private let condition = NSCondition()
+  private var pendingChunks: [Data] = []
   private var closed = false
   private var failure: Error?
   private var opened = false
+  private var writerStarted = false
+  private let writerQueue = DispatchQueue(label: "expo.modules.fetch.RequestBodyStream.writer")
 
   init() {
     var readStream: InputStream?
     var writeStream: OutputStream?
     Stream.getBoundStreams(
-      withBufferSize: Self.bufferSize,
+      withBufferSize: Self.boundBufferSize,
       inputStream: &readStream,
       outputStream: &writeStream
     )
@@ -32,20 +37,15 @@ internal final class RequestBodyStream: @unchecked Sendable {
   }
 
   func openIfNeeded() {
-    lock.lock()
-    defer { lock.unlock() }
-    if opened {
-      return
-    }
-    opened = true
-    inputStream.open()
-    outputStream.open()
+    condition.lock()
+    defer { condition.unlock() }
+    openIfNeededLocked()
   }
 
   func writeChunk(_ data: Data) throws {
-    openIfNeeded()
-    lock.lock()
-    defer { lock.unlock() }
+    condition.lock()
+    defer { condition.unlock() }
+    openIfNeededLocked()
     if closed {
       throw NSError(
         domain: NSPOSIXErrorDomain,
@@ -62,45 +62,98 @@ internal final class RequestBodyStream: @unchecked Sendable {
         ]
       )
     }
-    try writeFully(data)
+    if !data.isEmpty {
+      pendingChunks.append(data)
+      condition.broadcast()
+    }
   }
 
   func finish() {
-    openIfNeeded()
-    lock.lock()
-    defer { lock.unlock() }
+    condition.lock()
+    defer { condition.unlock() }
+    openIfNeededLocked()
     if closed {
       return
     }
     closed = true
-    outputStream.close()
+    condition.broadcast()
   }
 
   func fail(_ error: Error) {
-    openIfNeeded()
-    lock.lock()
-    defer { lock.unlock() }
+    condition.lock()
+    defer { condition.unlock() }
+    openIfNeededLocked()
     if closed {
       return
     }
     closed = true
     failure = error
-    outputStream.close()
+    condition.broadcast()
   }
 
-  private func writeFully(_ data: Data) throws {
+  private func openIfNeededLocked() {
+    if opened {
+      return
+    }
+    opened = true
+    inputStream.open()
+    outputStream.open()
+    if !writerStarted {
+      writerStarted = true
+      writerQueue.async { [weak self] in
+        self?.runWriter()
+      }
+    }
+  }
+
+  private func runWriter() {
+    while true {
+      let next: WriterWork
+      condition.lock()
+      while pendingChunks.isEmpty && !closed {
+        condition.wait()
+      }
+      if !pendingChunks.isEmpty {
+        next = .chunk(pendingChunks.removeFirst())
+      } else if let failure {
+        next = .fail(failure)
+      } else {
+        next = .finish
+      }
+      condition.unlock()
+
+      switch next {
+      case .chunk(let data):
+        do {
+          try writeFullyToOutput(data)
+        } catch {
+          condition.lock()
+          closed = true
+          failure = error
+          pendingChunks.removeAll()
+          condition.unlock()
+          outputStream.close()
+          return
+        }
+      case .finish, .fail:
+        outputStream.close()
+        return
+      }
+    }
+  }
+
+  private enum WriterWork {
+    case chunk(Data)
+    case finish
+    case fail(Error)
+  }
+
+  private func writeFullyToOutput(_ data: Data) throws {
     if data.isEmpty {
       return
     }
     var offset = 0
     while offset < data.count {
-      if closed {
-        throw NSError(
-          domain: NSPOSIXErrorDomain,
-          code: Int(EIO),
-          userInfo: [NSLocalizedDescriptionKey: "Request body is already closed"]
-        )
-      }
       let written: Int = data.withUnsafeBytes { rawBuffer in
         guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
           return -1
@@ -108,21 +161,15 @@ internal final class RequestBodyStream: @unchecked Sendable {
         return outputStream.write(base.advanced(by: offset), maxLength: data.count - offset)
       }
       if written < 0 {
-        let error = outputStream.streamError ?? NSError(
+        throw outputStream.streamError ?? NSError(
           domain: NSPOSIXErrorDomain,
           code: Int(EIO),
           userInfo: [NSLocalizedDescriptionKey: "Failed to write streaming request body"]
         )
-        failure = error
-        closed = true
-        outputStream.close()
-        throw error
       }
       if written == 0 {
-        // Bound buffer full — brief wait for URLSession to drain the input side.
-        lock.unlock()
+        // Bound buffer full — wait on the writer queue only (never on the JS bridge thread).
         Thread.sleep(forTimeInterval: 0.01)
-        lock.lock()
         continue
       }
       offset += written

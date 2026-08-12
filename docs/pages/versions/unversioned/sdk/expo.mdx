@@ -46,6 +46,26 @@ const buffer = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 
 console.log(buffer.length); // 512
 ```
 
+On Android and iOS, `ReadableStream` request bodies are also streamed to the network (chunked upload) instead of being buffered in memory first. You can pass `duplex: 'half'` to match the Fetch standard when sending a stream body:
+
+```ts Streaming upload
+import { fetch } from 'expo/fetch';
+
+const stream = new ReadableStream({
+  start(controller) {
+    controller.enqueue(new TextEncoder().encode('hello'));
+    controller.close();
+  },
+});
+
+await fetch('https://example.com/upload', {
+  method: 'POST',
+  body: stream,
+  duplex: 'half',
+  headers: { 'Content-Type': 'text/plain' },
+});
+```
+
 > **Note:** On Android and iOS, `expo/fetch` is also installed as the global `fetch`. This means any calls to `fetch(...)` without importing from `expo/fetch` use the same WinterCG-compliant implementation. To keep React Native's built-in `fetch` as the global, set `EXPO_PUBLIC_USE_RN_FETCH=1` in your [environment variables](/guides/environment-variables/). Named imports from `expo/fetch` continue to work regardless of this flag.
 
 ### Encoding APIs
